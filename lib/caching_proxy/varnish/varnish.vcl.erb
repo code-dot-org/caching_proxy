@@ -1,0 +1,114 @@
+vcl 4.0;
+import cookie;
+import header;
+import directors;
+import std;
+
+probe backend_healthcheck {
+  .url = "/health_check";
+  .window = 4;
+  .threshold = 2;
+  .initial = 2;
+  .interval = 15s;
+  .timeout = 10s;
+}
+
+<%
+  backends.each do |id, config|
+    origin = URI.parse config[:origin]
+    origin = URI.parse("http://#{origin}") if origin.host.nil?
+-%>
+
+backend backend_<%=id%> {
+  .host = "<%=origin.host%>";
+  .port = "<%=origin.port%>";
+  .connect_timeout = 600s;
+  .first_byte_timeout = 600s;
+  .between_bytes_timeout = 600s;
+  .probe = backend_healthcheck;
+}
+<% end -%>
+
+sub vcl_init {
+<% backends.keys.each do |id| -%>
+  new director_<%=id%> = directors.round_robin();
+  director_<%=id%>.add_backend(backend_<%=id%>);
+<% end -%>
+}
+
+# Respond to incoming requests.
+sub vcl_recv
+{
+### BACKEND HEALTH CHECKS
+  # Use "/health_check" to keep this instance in the load balancer.
+  if (req.method == "GET" && (req.url ~ "^/health_check.php$" || req.url ~ "^/health_check$")) {
+    if (1 && <%= vcl_and backends.keys.map {|id| "std.healthy(backend_#{id})"}%>) {
+      return(synth(200, "Backends are healthy."));
+    } else {
+      return(synth(503, "Backends are not healthy."));
+    }
+  }
+
+<% backends.keys.each do |id| -%>
+  if (req.method == "GET" && req.url ~ "^/health_check.<%=id%>$") {
+    if (std.healthy(backend_<%=id%>)) {
+      return(synth(200, "<%=id%> is healthy."));
+    } else {
+      return(synth(503, "<%=id%> is not healthy."));
+    }
+  }
+<% end -%>
+###
+
+### REQUEST COOKIE+HEADER FILTERS
+  if (req.http.Cookie) {
+    cookie.parse(req.http.Cookie);
+  }
+<%= setup_behavior(config, 'req', &method(:process_request)) %>
+  if (req.http.Cookie) {
+    set req.http.Cookie = cookie.get_string();
+    if (req.http.Cookie == "") {
+      unset req.http.Cookie;
+    }
+  }
+###
+
+### PROXIES
+<%= setup_behavior(config, 'req', &method(:process_proxy)) %>
+###
+
+  if (1 && <%=vcl_and ALLOWED_METHODS.map {|m| %(req.method != "#{m}")}%>) {
+    return(synth(403, "Unsupported HTTP request method."));
+  }
+  if (1 && <%=vcl_and CACHED_METHODS.map {|m| %(req.method != "#{m}")}%>) {
+    return (pass);
+  }
+}
+
+# Handle the HTTP response coming from our backend
+# beresp == Back-end response from the web server.
+sub vcl_backend_response {
+
+### RESPONSE COOKIE FILTER
+# Only apply cookie filter to cached HTTP methods.
+  if(1 && <%=vcl_or CACHED_METHODS.map {|m| %(bereq.method == "#{m}")}%>) {
+<%= setup_behavior(config, 'bereq', &method(:process_response)) %>
+  }
+###
+
+### UPSTREAM VARY HEADER
+<%= setup_behavior(config, 'bereq', &method(:process_vary)) %>
+###
+}
+
+sub vcl_deliver {
+  # Downstream Vary header.
+  if (resp.http.Vary) {
+    # Strip all "X-COOKIE-*" Vary header fields appearing anywhere in the comma-delimited header.
+    <% reg = '\s*X-COOKIE-[^,\s]+\s*' %>
+    if (resp.http.Vary ~ "<%=reg%>") {
+      set resp.http.Vary = regsuball(resp.http.Vary, "<%= "^#{reg},?\\s*|,#{reg}" %>", "");
+      <%= set_vary('Cookie', 'resp') %>
+    }
+  }
+}
